@@ -89,6 +89,34 @@ curl http://127.0.0.1:8000/api/templates
 curl http://127.0.0.1:8000/api/conflicts     # 冲突图与同标记违规
 ```
 
+`GET /api/conflicts` 按原始模板顺序逐对列出**全部实际冲突**（不再只列同标记的）：
+
+```json
+{
+  "success": true,
+  "version": 3,
+  "conflict_count": 5,
+  "same_marker_count": 2,
+  "different_marker_count": 3,
+  "same_marker_violations": [
+    {"code": "SAME_MARKER_CONFLICT", "marker": "1",
+     "templates": ["甲厂", "乙厂"], "detail": "same body may decode differently in: scale"}
+  ],
+  "conflicts": [
+    {"i": 0, "j": 2, "a": "甲厂", "b": "丙厂", "markers": ["1", "2"],
+     "same_marker": false, "compatible_body": true, "scale_can_differ": true,
+     "weight_can_differ": false, "conflict": true,
+     "reason": "same body may decode differently in: scale"}
+  ],
+  "marker_conflicts": [],
+  "different_marker_conflicts": []
+}
+```
+
+- `conflicts`：所有冲突对（含标记不同者），按 `(i, j)` 原始顺序排列，`i < j`。
+- `marker_conflicts` / `different_marker_conflicts`：分别只含同标记、不同标记的冲突对。
+- `same_marker_violations`：同标记冲突的警告摘要（与导入回执中的 `warnings` 同结构）。
+
 ### 3.2 导入现用模板及标记
 
 `POST /api/import`（等价别名：`/api/templates/import`、`/import`；查询参数 `mode=replace|append`、`force=true`）
@@ -108,7 +136,10 @@ curl -X POST http://127.0.0.1:8000/api/import \
 
 - 导入是“现状”，每套模板必须带一位数字 `marker`（接受 `"1"` 或 `1`），原样保留。
 - 默认 `mode=replace`（用导入集合替换生效配置，适合初始化/测试复位）；`mode=append` 追加。
-- 导入后会检查“同标记且冲突”的违规并在 `warnings` 中给出（正常现用配置应为空）。
+- 导入时逐对检查**本次写入的版号**，发现“同标记且冲突”时**仍可带警告生效**，
+  回执中 `warnings` 非空、`valid=false`，而 `config` 与该版号一致（正常现用配置应为空）。
+- 回执里的模板、警告与 `config` 都取自本次写入的版本，而不是之后再读的“当前生效”版本；
+  保存失败时整体不生效，`GET /api/config` 继续按原版供数。
 - 也可用 CLI：`python -m app.import_seed seed/current_templates.example.json`。
 
 ### 3.3 批量登记 + 配码（核心）
@@ -235,6 +266,19 @@ curl -X POST http://127.0.0.1:8000/api/admin/reset
 
 只要秤号或净重任一“可能不同”，这对模板之间连边，必须使用不同标记。
 该判定无需枚举 10^8 个正文。实现见 `app/conflicts.py`，并有完整单测。
+
+批量导入/配码时不会盲目逐对调用上述判定，而是按**前缀字典树**分组：
+
+- **前缀互斥**（分处不同分支）的模板永不共享正文，直接跳过、不构成约束；
+- 每一对模板只在其**较长前缀**所在节点判定一次（该前缀就是两者的共同正文域）；
+- 节点上可见的模板按“解码签名”（秤号取值序列 + 净重仿射式）归并：
+  截取位置虽不同、但对所有共有正文都解出相同结果的模板落入同一组，**不再逐对检查**；
+  签名相同的整组只需随前缀下推一次。
+- 实际冲突仍由 `analyze_pair` 按原顺序逐对给出，`GET /api/conflicts` 的 `reason`、
+  `conflict_count` 与逐对判定的结果完全一致。
+
+因此成批增加**无冲突**模板的判定开销不随配对数增长（约为模板数 × 前缀长度），
+只有真正冲突的对才会展开成对分析。
 
 ---
 

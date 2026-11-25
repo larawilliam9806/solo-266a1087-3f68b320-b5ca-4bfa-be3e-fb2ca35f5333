@@ -519,3 +519,171 @@ def test_batch_clique_uses_three_fresh_digits(client):
     assert len(set(j["markers"])) == 3
     assert "1" not in j["markers"]
     assert j["new_digit_count"] == 3
+
+
+def test_import_with_warnings_still_applies(client):
+    # Same marker, same body domain, different scale length => conflict.
+    payload = {
+        "templates": [
+            {"name": "a", "marker": "3", "prefix": "12",
+             "scale": {"start": 2, "length": 2},
+             "weight": {"start": 4, "length": 4}},
+            {"name": "b", "marker": "3", "prefix": "12",
+             "scale": {"start": 2, "length": 3},
+             "weight": {"start": 4, "length": 4}},
+        ]
+    }
+    r = client.post("/api/import", json=payload)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["valid"] is False
+    assert len(j["warnings"]) == 1
+    w = j["warnings"][0]
+    assert w["code"] == "SAME_MARKER_CONFLICT"
+    assert w["marker"] == "3"
+    assert "scale" in w["detail"]
+    # warning is about the written version and the import did take effect
+    assert j["config"]["version"] == j["version"]
+    assert j["config"]["template_count"] == 2
+    assert client.get("/api/config").json()["template_count"] == 2
+
+
+def test_import_receipt_uses_written_version(client, monkeypatch):
+    from app.domain import Range, TemplateSpec
+    from app.main import storage as st
+
+    original = st.commit_new_config
+    imported_version = {}
+
+    def commit_then_change(templates, reason):
+        version = original(templates, reason)
+        imported_version["v"] = version
+        # Another actor writes a newer, conflicting config right afterwards.
+        original(
+            [
+                TemplateSpec(
+                    name="x", marker="1", prefix="10", scale=Range(2, 2),
+                    weight=Range(4, 4),
+                ),
+                TemplateSpec(
+                    name="y", marker="1", prefix="10", scale=Range(2, 1),
+                    weight=Range(4, 4),
+                ),
+            ],
+            "concurrent",
+        )
+        return version
+
+    monkeypatch.setattr(st, "commit_new_config", commit_then_change)
+    r = client.post(
+        "/api/import",
+        json={"templates": [
+            {"name": "a", "marker": "1", "prefix": "10",
+             "scale": {"start": 2, "length": 2},
+             "weight": {"start": 4, "length": 4}},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["version"] == imported_version["v"]
+    assert j["config"]["version"] == imported_version["v"]
+    assert [t["name"] for t in j["config"]["templates"]] == ["a"]
+    assert j["valid"] is True
+    assert j["warnings"] == []
+    # active config is indeed the concurrent one
+    assert client.get("/api/config").json()["template_count"] == 2
+
+
+def test_conflicts_query_lists_different_marker_pairs(client):
+    client.post(
+        "/api/import",
+        json={"templates": [
+            {"name": "old", "marker": "1", "prefix": "12",
+             "scale": {"start": 2, "length": 2},
+             "weight": {"start": 4, "length": 4}},
+            {"name": "new", "marker": "2", "prefix": "12",
+             "scale": {"start": 2, "length": 3},
+             "weight": {"start": 4, "length": 4}},
+        ]},
+    )
+    j = client.get("/api/conflicts").json()
+    assert j["conflict_count"] == 1
+    assert j["same_marker_count"] == 0
+    assert j["different_marker_count"] == 1
+    assert j["same_marker_violations"] == []
+    entry = j["conflicts"][0]
+    assert entry["same_marker"] is False
+    assert entry["markers"] == ["1", "2"]
+    assert j["different_marker_conflicts"] == [entry]
+    assert j["marker_conflicts"] == []
+
+
+def test_conflicts_query_mixed_markers_keep_original_order(client):
+    client.post(
+        "/api/import",
+        json={"templates": [
+            {"name": "a", "marker": "1", "prefix": "9",
+             "scale": {"start": 2, "length": 2},
+             "weight": {"start": 4, "length": 4}},
+            {"name": "b", "marker": "1", "prefix": "90",
+             "scale": {"start": 2, "length": 2},
+             "weight": {"start": 4, "length": 4}},
+            {"name": "c", "marker": "1", "prefix": "90",
+             "scale": {"start": 2, "length": 3},
+             "weight": {"start": 4, "length": 4}},
+            {"name": "d", "marker": "2", "prefix": "",
+             "scale": {"start": 0, "length": 4},
+             "weight": {"start": 4, "length": 4}},
+        ]},
+    )
+    j = client.get("/api/conflicts").json()
+    # Same marker 1: (0,2) and (1,2). Different markers: (0,3), (1,3), (2,3).
+    assert [(p["i"], p["j"]) for p in j["conflicts"]] == [
+        (0, 2), (0, 3), (1, 2), (1, 3), (2, 3),
+    ]
+    assert [(p["i"], p["j"]) for p in j["marker_conflicts"]] == [(0, 2), (1, 2)]
+    assert [(p["i"], p["j"]) for p in j["different_marker_conflicts"]] == [
+        (0, 3), (1, 3), (2, 3),
+    ]
+    assert j["same_marker_count"] == 2
+    assert j["different_marker_count"] == 3
+
+
+def test_save_failure_on_import_keeps_original_config(client, monkeypatch):
+    import_two(client)
+    before = client.get("/api/config").json()
+
+    from app.main import storage as st
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(st, "commit_new_config", boom)
+    r = client.post(
+        "/api/import",
+        json={"templates": [
+            {"name": "z", "marker": "7", "prefix": "70",
+             "scale": {"start": 2, "length": 2},
+             "weight": {"start": 4, "length": 4}},
+        ]},
+    )
+    assert r.status_code == 500
+    assert r.json()["code"] == "SAVE_FAILED"
+    after = client.get("/api/config").json()
+    assert after["version"] == before["version"]
+    assert after["template_count"] == before["template_count"]
+
+
+def test_import_many_conflict_free_templates(client):
+    templates = [
+        {"name": f"m{i}", "marker": "0", "prefix": f"{i:08d}",
+         "scale": {"start": 2, "length": 2},
+         "weight": {"start": 4, "length": 4}}
+        for i in range(400)
+    ]
+    r = client.post("/api/import", json={"templates": templates, "force": True})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["valid"] is True
+    assert j["warnings"] == []
+    assert j["config"]["template_count"] == 400

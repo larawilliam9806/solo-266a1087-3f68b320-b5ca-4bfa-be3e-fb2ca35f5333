@@ -72,8 +72,6 @@ def _maybe_seed() -> None:
         with open(seed_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         req = BatchRequest.model_validate(data)
-        from .payload import parse_marker  # noqa: F401
-
         specs = _to_specs(req)
         import_templates(storage, specs, mode=req.mode or "replace", force=req.force)
         logger.info("seeded %s templates from %s", len(specs), seed_file)
@@ -261,31 +259,38 @@ def list_versions() -> dict:
 
 @app.get("/api/conflicts")
 def get_conflicts() -> dict:
-    from .conflicts import analyze_pair
+    from .conflicts import conflict_analysis
 
     version, templates = storage.active_config()
     pairs = []
-    for i in range(len(templates)):
-        for j in range(i + 1, len(templates)):
-            a = analyze_pair(templates[i], templates[j])
-            if a.conflict:
-                pairs.append(
-                    {
-                        "i": i,
-                        "j": j,
-                        "a": templates[i].name or i,
-                        "b": templates[j].name or j,
-                        "markers": [templates[i].marker, templates[j].marker],
-                        "same_marker": templates[i].marker == templates[j].marker,
-                        **a.to_dict(),
-                    }
-                )
+    marker_pairs = []  # conflicts whose markers are the same
+    mixed_marker_pairs = []  # conflicts whose markers differ
+    for i, j, analysis in conflict_analysis(templates):
+        entry = {
+            "i": i,
+            "j": j,
+            "a": templates[i].name or i,
+            "b": templates[j].name or j,
+            "markers": [templates[i].marker, templates[j].marker],
+            "same_marker": templates[i].marker == templates[j].marker,
+            **analysis.to_dict(),
+        }
+        pairs.append(entry)
+        if entry["same_marker"]:
+            marker_pairs.append(entry)
+        else:
+            mixed_marker_pairs.append(entry)
     return {
         "success": True,
         "version": version,
         "conflict_count": len(pairs),
+        "same_marker_count": len(marker_pairs),
+        "different_marker_count": len(mixed_marker_pairs),
         "same_marker_violations": pair_warnings(templates),
+        # All conflicting pairs, including ones with different markers.
         "conflicts": pairs,
+        "marker_conflicts": marker_pairs,
+        "different_marker_conflicts": mixed_marker_pairs,
     }
 
 

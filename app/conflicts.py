@@ -153,12 +153,202 @@ def conflicts(a: TemplateSpec, b: TemplateSpec) -> bool:
 
 
 def build_adjacency(templates: list[TemplateSpec]) -> list[set[int]]:
-    """Conflict graph adjacency (indices into ``templates``)."""
+    """Conflict graph adjacency (indices into ``templates``).
+
+    Uses :func:`conflict_pairs`, which is near-linear for large conflict-free
+    batches instead of blindly analysing every pair.
+    """
     n = len(templates)
     adj: list[set[int]] = [set() for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if conflicts(templates[i], templates[j]):
-                adj[i].add(j)
-                adj[j].add(i)
+    for i, j in conflict_pairs(templates):
+        adj[i].add(j)
+        adj[j].add(i)
     return adj
+
+
+# ---------------------------------------------------------------------------
+# Scalable detection for whole template collections
+# ---------------------------------------------------------------------------
+#
+# ``analyze_pair`` is exact but pairwise.  When thousands of templates are
+# force-imported, calling it for every pair is O(n^2) even when the templates
+# are all compatible.  We instead walk the prefix trie:
+#
+# * Templates in different trie branches have mutually exclusive prefixes and
+#   are never compared ("前缀互斥的模板要跳过").
+# * At every trie node P only templates whose prefix is a prefix of P are
+#   visible.  For a pair (a, b) the longer prefix is the pair's common domain,
+#   so its conflict is decided exactly once, at the node of the longer prefix.
+# * Templates visible at a node are canonicalised into a *decode signature*
+#   relative to P: the scale token sequence (fixed digit / free body position)
+#   and the affine net-weight form.  Two templates conflict on domain P iff
+#   their signatures differ.  Templates whose extraction positions differ but
+#   which decode identically on every shared body therefore land in the same
+#   group and are not compared pair by pair.
+#
+# All templates sharing one signature at a node remain identical after any
+# further prefix digit is fixed, so a whole group is restricted once and
+# carried down the trie; an entirely conflict-free batch keeps one group per
+# node and costs O(templates * prefix-length), not O(pairs).
+
+Signature = tuple  # (scale_tokens, weight_constant, weight_coefficients)
+
+
+class _Group:
+    """Lazily materialised set of template indices (persistent, cheap merge)."""
+
+    __slots__ = ("parts",)
+
+    def __init__(self, parts: tuple) -> None:
+        self.parts = parts
+
+
+def _group_members(group: _Group) -> list[int]:
+    out: list[int] = []
+    stack: list = [group]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, _Group):
+            stack.extend(item.parts)
+        elif isinstance(item, tuple):
+            out.extend(item)
+        else:
+            out.append(item)
+    return out
+
+
+def _weight_coefficients(t: TemplateSpec) -> tuple[int, ...]:
+    """Affine coefficients of the template's gram value over body digits."""
+    coeff = [0] * BODY_LENGTH
+    la = t.weight.length
+    for k in range(la):
+        coeff[t.weight.start + k] += 10 ** (la - 1 - k)
+    return tuple(coeff)
+
+
+def _signature(t: TemplateSpec, digits: tuple[int, ...]) -> Signature:
+    """Canonical decode function of ``t`` restricted to bodies ``digits + *``.
+
+    ``digits`` are the fixed leading body digits of the longer prefix.  Two
+    templates with the same signature decode identically on that whole domain.
+    """
+    depth = len(digits)
+    tokens = tuple(
+        ("c", digits[pos]) if pos < depth else ("v", pos)
+        for pos in range(t.scale.start, t.scale.end)
+    )
+    coeff = list(_weight_coefficients(t))
+    constant = 0
+    for pos in range(depth):
+        c = coeff[pos]
+        if c:
+            constant += c * digits[pos]
+            coeff[pos] = 0
+    return (tokens, constant, tuple(coeff))
+
+
+def _restrict(sig: Signature, pos: int, digit: int) -> Signature:
+    """Signature on the sub-domain where body digit ``pos`` equals ``digit``."""
+    tokens, constant, coeffs = sig
+    new_tokens = tuple(
+        ("c", digit) if kind == "v" and p == pos else (kind, p)
+        for kind, p in tokens
+    )
+    coeff = list(coeffs)
+    c = coeff[pos]
+    if c:
+        constant += c * digit
+        coeff[pos] = 0
+    return (new_tokens, constant, tuple(coeff))
+
+
+def _add_cross_pairs(
+    pairs: set[tuple[int, int]], ga: _Group, gb: _Group
+) -> None:
+    for a in _group_members(ga):
+        for b in _group_members(gb):
+            pairs.add((a, b) if a < b else (b, a))
+
+
+def conflict_pairs(templates: list[TemplateSpec]) -> list[tuple[int, int]]:
+    """Return every conflicting ``(i, j)`` pair with ``i < j``, sorted.
+
+    The result is exactly the set of pairs for which :func:`analyze_pair`
+    reports a conflict, but computed by prefix-trie grouping so conflict-free
+    batches cost far less than the quadratic pair count.
+    """
+    n = len(templates)
+    if n < 2:
+        return []
+
+    root: dict = {"children": {}, "exact": [], "digits": ()}
+    for idx, t in enumerate(templates):
+        node = root
+        for ch in t.prefix:
+            child = node["children"].get(ch)
+            if child is None:
+                child = {
+                    "children": {},
+                    "exact": [],
+                    "digits": node["digits"] + (int(ch),),
+                }
+                node["children"][ch] = child
+            node = child
+        node["exact"].append(idx)
+
+    pairs: set[tuple[int, int]] = set()
+    # (node, ancestor signature -> group) ; root has no visible ancestors.
+    stack: list[tuple[dict, dict[Signature, _Group]]] = [(root, {})]
+
+    while stack:
+        node, ancestors = stack.pop()
+        digits = node["digits"]
+
+        raw: dict[Signature, list[int]] = {}
+        for idx in node["exact"]:
+            sig = _signature(templates[idx], digits)
+            raw.setdefault(sig, []).append(idx)
+        exact_groups = {sig: _Group((tuple(idxs),)) for sig, idxs in raw.items()}
+
+        # Exact templates conflict with each other (distinct signatures by
+        # construction) and with visible ancestors of a different signature.
+        # If ``ancestors`` already contains the same signature, then ancestor
+        # templates decode identically with these (and recursively with each
+        # other), so they are not compared again.
+        items = list(exact_groups.items())
+        for x, (sig_e, ge) in enumerate(items):
+            for sig_o, go in items[x + 1 :]:
+                _add_cross_pairs(pairs, ge, go)
+            for sig_a, ga in ancestors.items():
+                if sig_a != sig_e:
+                    _add_cross_pairs(pairs, ge, ga)
+
+        # Everything visible at this node is visible to its children.
+        merged: dict[Signature, _Group] = dict(ancestors)
+        for sig, ge in exact_groups.items():
+            prev = merged.get(sig)
+            merged[sig] = ge if prev is None else _Group((prev, ge))
+
+        depth = len(digits)
+        for ch, child in node["children"].items():
+            digit = int(ch)
+            child_groups: dict[Signature, _Group] = {}
+            for sig, group in merged.items():
+                restricted = _restrict(sig, depth, digit)
+                prev = child_groups.get(restricted)
+                child_groups[restricted] = (
+                    group if prev is None else _Group((prev, group))
+                )
+            stack.append((child, child_groups))
+
+    return sorted(pairs)
+
+
+def conflict_analysis(
+    templates: list[TemplateSpec],
+) -> list[tuple[int, int, PairAnalysis]]:
+    """Conflicting pairs (original order) with their per-pair analysis."""
+    return [
+        (i, j, analyze_pair(templates[i], templates[j]))
+        for i, j in conflict_pairs(templates)
+    ]

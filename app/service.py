@@ -6,7 +6,7 @@ import threading
 from typing import Any, Optional
 
 from .coloring import NoAssignment, solve_markers
-from .conflicts import analyze_pair
+from .conflicts import conflict_analysis, conflict_pairs
 from .domain import MAX_TEMPLATES, TemplateSpec
 from .storage import Storage
 
@@ -72,24 +72,47 @@ def template_to_dict(t: TemplateSpec, index: Optional[int] = None) -> dict[str, 
 
 
 def pair_warnings(templates: list[TemplateSpec]) -> list[dict[str, Any]]:
-    """Report same-marker pairs that actually conflict (invalid current config)."""
-    warnings: list[dict[str, Any]] = []
-    for i in range(len(templates)):
-        for j in range(i + 1, len(templates)):
-            a, b = templates[i], templates[j]
-            if a.marker != b.marker:
-                continue
-            analysis = analyze_pair(a, b)
-            if analysis.conflict:
-                warnings.append(
-                    {
-                        "code": "SAME_MARKER_CONFLICT",
-                        "marker": a.marker,
-                        "templates": [a.name or i, b.name or j],
-                        "detail": analysis.reason,
-                    }
-                )
-    return warnings
+    """Report same-marker pairs that actually conflict (invalid current config).
+
+    Only same-marker templates can violate the rule, so detection runs per
+    marker group (and :func:`conflict_pairs` already skips prefix-exclusive or
+    decode-identical templates).  Reasons are still computed pair by pair, in
+    the original template order, only for the conflicting pairs.
+    """
+    groups: dict[str, list[int]] = {}
+    for i, t in enumerate(templates):
+        if t.marker is not None:
+            groups.setdefault(t.marker, []).append(i)
+
+    found: list[tuple[int, int, str, Any]] = []
+    for marker, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        subset = [templates[i] for i in indices]
+        for i, j, analysis in conflict_analysis(subset):
+            gi, gj = indices[i], indices[j]
+            if gi > gj:
+                gi, gj = gj, gi
+            found.append((gi, gj, marker, analysis))
+    found.sort(key=lambda item: (item[0], item[1]))
+
+    return [
+        {
+            "code": "SAME_MARKER_CONFLICT",
+            "marker": marker,
+            "templates": [
+                templates[i].name or i,
+                templates[j].name or j,
+            ],
+            "detail": analysis.reason,
+        }
+        for i, j, marker, analysis in found
+    ]
+
+
+def conflicting_pairs(templates: list[TemplateSpec]) -> list[tuple[int, int]]:
+    """All conflicting index pairs, in original order (i < j)."""
+    return conflict_pairs(templates)
 
 
 def config_to_dict(
@@ -147,10 +170,11 @@ def import_templates(
 
     with service_lock:
         if mode == "append":
-            _, old = storage.active_config()
+            version_before, old = storage.active_config()
             combined = list(old) + list(templates)
             reason = "import-append"
         elif mode == "replace":
+            version_before, _ = storage.active_config()
             combined = list(templates)
             reason = "import-replace"
         else:
@@ -170,16 +194,26 @@ def import_templates(
                 },
             )
 
-        version = storage.commit_new_config(combined, reason=reason)
-        _, active = storage.active_config()
-        warnings = pair_warnings(active)
+        try:
+            version = storage.commit_new_config(combined, reason=reason)
+            # The receipt describes exactly what was written: read back that
+            # version rather than whatever happens to be active afterwards.
+            written = storage.templates_at(version)
+        except Exception as exc:  # save failure -> original config stays active
+            raise ServiceError(
+                "SAVE_FAILED",
+                f"配置保存失败，已沿用原配置: {exc}",
+                status=500,
+                details={"active_version": version_before},
+            ) from exc
+        warnings = pair_warnings(written)
         return {
             "version": version,
             "imported_count": len(templates),
             "mode": mode,
             "warnings": warnings,
             "valid": not warnings,
-            "config": config_to_dict(version, active),
+            "config": config_to_dict(version, written),
         }
 
 
@@ -235,6 +269,9 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
 
         try:
             new_version = storage.commit_new_config(combined, reason="assign-batch")
+            # The response is built from the version that was actually
+            # written, so templates and count always describe that version.
+            active = storage.templates_at(new_version)
         except Exception as exc:  # save failure -> original config stays active
             raise ServiceError(
                 "SAVE_FAILED",
@@ -243,7 +280,6 @@ def assign_batch(storage: Storage, new_templates: list[TemplateSpec]) -> dict[st
                 details={"active_version": version_before},
             ) from exc
 
-        _, active = storage.active_config()
         old_marker_set = {t.marker for t in old}
         fresh = sorted({m for m in chosen if m not in old_marker_set})
 
